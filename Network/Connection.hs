@@ -17,15 +17,26 @@ module Network.Connection
     , connectionID
     , ConnectionParams(..)
     , TLSSettings(..)
+    , defaultTLSClientSettings
+    , defaultTLSServerSettings
     , ProxySettings(..)
     , SockSettings
+
+    -- * Type for Listener
+    , Listener
 
     -- * Exceptions
     , LineTooLong(..)
 
     -- * Library initialization
     , initConnectionContext
+    , initConnectionContext'
     , ConnectionContext
+
+    -- * Listener operation
+    , N.PortID(..)
+    , listenOn
+    , accept
 
     -- * Connection operation
     , connectFromHandle
@@ -60,6 +71,7 @@ import qualified Network as N
 
 import Data.Default.Class
 import Data.Data
+import Data.Monoid
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
@@ -73,6 +85,8 @@ import System.IO
 import qualified Data.Map as M
 
 import Network.Connection.Types
+
+import Debug.Trace
 
 type Manager = MVar (M.Map TLS.SessionID TLS.SessionData)
 
@@ -92,13 +106,45 @@ connectionSessionManager mvar = TLS.SessionManager
 
 -- | Initialize the library with shared parameters between connection.
 initConnectionContext :: IO ConnectionContext
-initConnectionContext = ConnectionContext <$> getSystemCertificateStore
-                                          <*> createEntropyPool
+initConnectionContext =
+    ConnectionContext <$> getSystemCertificateStore
+                      <*> createEntropyPool
+                      <*> pure mempty
+
+-- | Initialize the library with shared parameters between connection.
+--
+-- But also adds the Credentials (useful for Listener/server side)
+initConnectionContext' :: TLS.Credentials -> IO ConnectionContext
+initConnectionContext' creds = do
+    ctx <- initConnectionContext
+    return $ ctx { globalCredentials = creds }
+
+withTLSClientParams :: String
+                    -> ConnectionContext
+                    -> ConnectionID
+                    -> TLSSettings
+                    -> (TLS.ClientParams -> a)
+                    -> a
+withTLSClientParams str cg cid ts f =
+    case makeTLSParams cg cid ts of
+        Left  _ -> error $ str ++ ": expecting TLS Client Settings..."
+        Right s -> f s
+
+withTLSServerParams :: String
+                    -> ConnectionContext
+                    -> ConnectionID
+                    -> TLSSettings
+                    -> (TLS.ServerParams -> a)
+                    -> a
+withTLSServerParams str cg cid ts f =
+    case makeTLSParams cg cid ts of
+        Left  s -> f s
+        Right _ -> error $ str ++ ": expecting TLS Server Settings..."
 
 -- | Create a final TLS 'ClientParams' according to the destination and the
 -- TLSSettings.
-makeTLSParams :: ConnectionContext -> ConnectionID -> TLSSettings -> TLS.ClientParams
-makeTLSParams cg cid ts@(TLSSettingsSimple {}) =
+makeTLSParams :: ConnectionContext -> ConnectionID -> TLSSettings -> Either TLS.ServerParams TLS.ClientParams
+makeTLSParams cg cid ts@(TLSSettingsSimple {}) = Right $
     (TLS.defaultParamsClient (fst cid) portString)
         { TLS.clientSupported = def { TLS.supportedCiphers = TLS.ciphersuite_all }
         , TLS.clientShared    = def
@@ -113,18 +159,52 @@ makeTLSParams cg cid ts@(TLSSettingsSimple {}) =
                                     (\_ _ _ -> return ())
             | otherwise = def
         portString = BC.pack $ show $ snd cid
-makeTLSParams _ cid (TLSSettings p) =
+makeTLSParams _ cid (TLSSettings p) = Right $
     p { TLS.clientServerIdentification = (fst cid, portString) }
  where portString = BC.pack $ show $ snd cid
+makeTLSParams cg _ ts@(TLSServerSettingsSimple {}) = Left $ def
+    { TLS.serverWantClientCert = settingEnableCertificateValidation ts
+    , TLS.serverCACertificates = settingsCACertificates ts
+    , TLS.serverSupported = def { TLS.supportedCiphers = TLS.ciphersuite_all }
+    , TLS.serverShared    = def
+        { TLS.sharedCAStore         = globalCertificateStore cg
+        , TLS.sharedValidationCache = validationCache
+        , TLS.sharedCredentials     = globalCredentials cg
+        -- , TLS.sharedSessionManager  = connectionSessionManager
+        }
+    }
+  where validationCache
+            | settingEnableCertificateValidation ts = def
+            | otherwise =
+                TLS.ValidationCache (\_ _ _ -> return TLS.ValidationCachePass)
+                                    (\_ _ _ -> return ())
+makeTLSParams _ _ (TLSServerSettings p) = Left p
 
 withBackend :: (ConnectionBackend -> IO a) -> Connection -> IO a
 withBackend f conn = readMVar (connectionBackend conn) >>= f
 
-connectionNew :: ConnectionID -> ConnectionBackend -> IO Connection
-connectionNew cid backend =
-    Connection <$> newMVar backend
-               <*> newMVar (Just B.empty)
-               <*> pure cid
+listenOn :: ConnectionContext
+         -> N.PortID
+         -> IO Listener
+listenOn cg portInfo = Listener cg <$> N.listenOn portInfo
+
+accept :: Maybe TLSSettings
+       -> Listener
+       -> IO Connection
+accept settings l = do
+    (h, hostname, portnumber) <- N.accept $ listenerSocket l
+    acceptFromHandle (listenerContext l) h (hostname, portnumber) settings
+
+acceptFromHandle :: ConnectionContext
+                 -> Handle
+                 -> ConnectionID
+                 -> Maybe TLSSettings
+                 -> IO Connection
+acceptFromHandle cg h cid settings =
+    case settings of
+        Nothing -> connectionNew cid $ ConnectionStream h ConnectionServer
+        Just t  -> withTLSServerParams "acceptFromHandle" cg cid t $ \params ->
+            tlsEstablish cg h params >>= connectionNew cid . ConnectionTLS
 
 -- | Use an already established handle to create a connection object.
 --
@@ -135,9 +215,11 @@ connectFromHandle :: ConnectionContext
                   -> ConnectionParams
                   -> IO Connection
 connectFromHandle cg h p = withSecurity (connectionUseSecure p)
-    where withSecurity Nothing            = connectionNew cid $ ConnectionStream h
-          withSecurity (Just tlsSettings) = tlsEstablish cg h (makeTLSParams cg cid tlsSettings) >>= connectionNew cid . ConnectionTLS
-          cid = (connectionHostname p, connectionPort p)
+  where
+    withSecurity Nothing            = connectionNew cid $ ConnectionStream h ConnectionClient
+    withSecurity (Just tlsSettings) = withTLSClientParams "connectFromHandle" cg cid tlsSettings $ \params ->
+        tlsEstablish cg h params >>= connectionNew cid . ConnectionTLS
+    cid = (connectionHostname p, connectionPort p)
 
 -- | connect to a destination using the parameter
 connectTo :: ConnectionContext -- ^ The global context of this connection.
@@ -176,8 +258,8 @@ connectTo cg cParams = do
 -- | Put a block of data in the connection.
 connectionPut :: Connection -> ByteString -> IO ()
 connectionPut connection content = withBackend doWrite connection
-    where doWrite (ConnectionStream h) = B.hPut h content >> hFlush h
-          doWrite (ConnectionTLS ctx)  = TLS.sendData ctx $ L.fromChunks [content]
+    where doWrite (ConnectionStream h _) = B.hPut h content >> hFlush h
+          doWrite (ConnectionTLS ctx)    = TLS.sendData ctx $ L.fromChunks [content]
 
 -- | Get some bytes from a connection.
 --
@@ -218,7 +300,7 @@ connectionGetChunkBase loc conn f =
                   updateBuf buf
   where
     getMoreData (ConnectionTLS tlsctx) = TLS.recvData tlsctx
-    getMoreData (ConnectionStream h)   = B.hGetSome h (16 * 1024)
+    getMoreData (ConnectionStream h _) = B.hGetSome h (16 * 1024)
 
     updateBuf buf = case f buf of (a, !buf') -> return (Just buf', a)
     closeBuf  buf = case f buf of (a, _buf') -> return (Nothing, a)
@@ -282,7 +364,7 @@ throwEOF conn loc =
 connectionClose :: Connection -> IO ()
 connectionClose = withBackend backendClose
     where backendClose (ConnectionTLS ctx)  = TLS.bye ctx >> TLS.contextClose ctx
-          backendClose (ConnectionStream h) = hClose h
+          backendClose (ConnectionStream h _) = hClose h
 
 -- | Activate secure layer using the parameters specified.
 --
@@ -300,19 +382,24 @@ connectionSetSecure cg connection params =
     modifyMVar_ (connectionBuffer connection) $ \b ->
     modifyMVar (connectionBackend connection) $ \backend ->
         case backend of
-            (ConnectionStream h) -> do ctx <- tlsEstablish cg h (makeTLSParams cg (connectionID connection) params)
-                                       return (ConnectionTLS ctx, Just B.empty)
+            (ConnectionStream h ConnectionClient) -> trace ("client params") $ withTLSClientParams "connectionSetSecure" cg (connectionID connection) params $ \p -> do
+                ctx <- trace ("establish TLS Connection") $ tlsEstablish cg h p
+                return $ trace "connection established" $ (ConnectionTLS ctx, Just B.empty)
+            (ConnectionStream h ConnectionServer) -> trace ("server params") $ withTLSServerParams "connectionSetSecure" cg (connectionID connection) params $ \p -> do
+                ctx <- trace ("establish TLS Connection") $ tlsEstablish cg h p
+                return $ trace "connection established" $ (ConnectionTLS ctx, Just B.empty)
             (ConnectionTLS _)    -> return (backend, b)
 
 -- | Returns if the connection is establish securely or not.
 connectionIsSecure :: Connection -> IO Bool
 connectionIsSecure conn = withBackend isSecure conn
-    where isSecure (ConnectionStream _) = return False
-          isSecure (ConnectionTLS _)    = return True
+    where isSecure (ConnectionStream _ _) = return False
+          isSecure (ConnectionTLS _)      = return True
 
-tlsEstablish :: ConnectionContext -> Handle -> TLS.ClientParams -> IO TLS.Context
+tlsEstablish :: (TLS.TLSParams params)
+             => ConnectionContext -> Handle -> params -> IO TLS.Context
 tlsEstablish cg handle tlsParams = do
-    rng <- RNG.initialize <$> grabEntropyIO 40 (globalEntropyPool cg)
-    ctx <- TLS.contextNew handle tlsParams rng
-    TLS.handshake ctx
-    return ctx
+    rng <- trace ("RNG") $ RNG.initialize <$> grabEntropyIO 40 (globalEntropyPool cg)
+    ctx <- trace ("new ctx") $ TLS.contextNew handle tlsParams rng
+    trace "handshake" $ TLS.handshake ctx
+    return $ trace "established" ctx

@@ -10,21 +10,29 @@
 module Network.Connection.Types
     where
 
-import Control.Concurrent.MVar (MVar)
+import Control.Applicative
+import Control.Concurrent.MVar (MVar, newMVar)
 import Crypto.Random (EntropyPool)
 
+import qualified Data.ByteString as B
 import Data.Default.Class
+import qualified Data.X509 as X509
 import Data.X509.CertificateStore
 import Data.ByteString (ByteString)
 
+import qualified Network as N
 import Network.BSD (HostName)
 import Network.Socket (PortNumber)
 import qualified Network.TLS as TLS
 
 import System.IO (Handle)
 
+data ConnectionType =
+       ConnectionClient
+     | ConnectionServer
+
 -- | Simple backend enumeration, either using a raw connection or a tls connection.
-data ConnectionBackend = ConnectionStream Handle
+data ConnectionBackend = ConnectionStream Handle ConnectionType
                        | ConnectionTLS TLS.Context
 
 -- | Connection Parameters to establish a Connection.
@@ -74,12 +82,33 @@ data TLSSettings
              , settingUseServerName                :: Bool -- ^ Use server name extension. Not Implemented Yet.
              } -- ^ Simple TLS settings. recommended to use.
     | TLSSettings TLS.ClientParams -- ^ full blown TLS Settings directly using TLS.Params. for power users.
+    | TLSServerSettingsSimple
+             { settingEnableCertificateValidation :: Bool -- ^ Disable certificate verification completely,
+                                                          --   this make TLS/SSL vulnerable to a MITM attack.
+                                                          --   not recommended to use, but for testing.
+             , settingsCACertificates :: [X509.SignedCertificate]
+             } -- ^ Simple TLS settings. recommended to use.
+    | TLSServerSettings TLS.ServerParams -- ^ full blown TLS Settings directly using TLS.Params. for power users.
     deriving (Show)
 
+-- | The Default TLSSettings for Listener/Server side
+defaultTLSServerSettings :: TLSSettings
+defaultTLSServerSettings = TLSServerSettingsSimple False []
+
+-- | The default TLSSettings for Connection/Client side
+defaultTLSClientSettings :: TLSSettings
+defaultTLSClientSettings = TLSSettingsSimple False False False
+
 instance Default TLSSettings where
-    def = TLSSettingsSimple False False False
+    def = defaultTLSClientSettings
 
 type ConnectionID = (HostName, PortNumber)
+
+-- | Opaque type that represents a Listener to accept connection from
+data Listener = Listener
+    { listenerContext :: !ConnectionContext
+    , listenerSocket  :: !N.Socket
+    }
 
 -- | This opaque type represent a connection to a destination.
 data Connection = Connection
@@ -88,6 +117,12 @@ data Connection = Connection
     , connectionID      :: ConnectionID  -- ^ return a simple tuple of the port and hostname that we're connected to.
     }
 
+connectionNew :: ConnectionID -> ConnectionBackend -> IO Connection
+connectionNew cid backend =
+    Connection <$> newMVar backend
+               <*> newMVar (Just B.empty)
+               <*> pure cid
+
 -- | Shared values (certificate store, sessions, ..) between connections
 --
 -- At the moment, this is only strictly needed to shared sessions and certificates
@@ -95,4 +130,5 @@ data Connection = Connection
 data ConnectionContext = ConnectionContext
     { globalCertificateStore :: !CertificateStore
     , globalEntropyPool      :: !EntropyPool
+    , globalCredentials      :: !TLS.Credentials
     }
